@@ -8,6 +8,7 @@ import SystemHealth from "./pages/SystemHealth";
 import BlockedIPs from "./pages/BlockedIPs";
 import Alerts from "./pages/Alerts";
 import Settings from "./pages/Settings";
+import Signup from "./pages/Signup";
 
 function App() {
   return (
@@ -16,6 +17,7 @@ function App() {
 
         {/* Login Page First */}
         <Route path="/" element={<Login />} />
+        <Route path="/signup" element={<Signup />} />
 
         {/* Dashboard */}
         <Route path="/dashboard" element={<Dashboard />} />
