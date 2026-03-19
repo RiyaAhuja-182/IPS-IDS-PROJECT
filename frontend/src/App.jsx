@@ -18,11 +18,7 @@ function App() {
 
         {/* Login Page First */}
         <Route path="/" element={<Login />} />
-<<<<<<< HEAD
-        <Route path="/Signup" element={<CreateAccount />} />
-=======
         <Route path="/signup" element={<Signup />} />
->>>>>>> c02169f752ed4c6a78d28f76f9d19af9817ed372
 
         {/* Dashboard */}
         <Route path="/dashboard" element={<Dashboard />} />
