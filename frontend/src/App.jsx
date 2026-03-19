@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 
 import Login from "./pages/Login";
+import CreateAccount from "./pages/Signup";
 import Dashboard from "./pages/Dashboard";
 import TrafficMonitor from "./pages/TrafficMonitor";
 import ThreatIntel from "./pages/ThreatIntelligence";
@@ -16,6 +17,7 @@ function App() {
 
         {/* Login Page First */}
         <Route path="/" element={<Login />} />
+        <Route path="/Signup" element={<CreateAccount />} />
 
         {/* Dashboard */}
         <Route path="/dashboard" element={<Dashboard />} />
