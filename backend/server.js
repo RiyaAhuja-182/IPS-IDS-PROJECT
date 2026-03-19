@@ -1,230 +1,185 @@
-require('dotenv').config();
-
-// ────────────────────────────────────────────────
-// ENV DEBUG
-console.log("───────────────────────────────────────────────");
-console.log("Environment variables loaded from .env:");
-console.log("PORT      =", process.env.PORT || "(not set)");
-console.log("MONGO_URI =", process.env.MONGO_URI 
-  ? process.env.MONGO_URI.substring(0, 60) + "..." 
-  : "NOT FOUND!");
-console.log("───────────────────────────────────────────────");
-
-if (!process.env.MONGO_URI) {
-  console.error("❌ MONGO_URI missing in .env");
-  process.exit(1);
-}
-
-// ────────────────────────────────────────────────
-// IMPORTS
-const dns = require("dns");
-dns.setServers(["8.8.8.8", "8.8.4.4"]);
-
 const express = require("express");
 const cors = require("cors");
-const mongoose = require("mongoose");
-const bcrypt = require("bcryptjs");
-
-const User = require("./models/User");
 
 const app = express();
+const PORT = 5000;
 
-// ────────────────────────────────────────────────
-// MIDDLEWARE
-app.use(cors({
-  origin: ["http://localhost:5173", "http://localhost:3000"],
-  methods: ["GET", "POST"],
-  allowedHeaders: ["Content-Type"]
-}));
+const PACKET_WINDOW_MS = 30 * 1000;
+const PORT_SCAN_THRESHOLD = 20;
+const SUSPICIOUS_PACKET_SIZE_THRESHOLD = 1000;
 
+let packets = [];
+let threats = [];
+let blockedIPs = [];
+let users = [];
+const ipRequests = {};
+const detectedThreatKeys = new Set();
+
+app.use(cors());
 app.use(express.json());
 
-// LOG ALL REQUESTS
-app.use((req, res, next) => {
-  console.log(`➡️ ${req.method} ${req.originalUrl}`);
-  next();
-});
+function nowIso() {
+  return new Date().toISOString();
+}
 
-// ────────────────────────────────────────────────
-// 🔥 MONGODB CONNECTION (FIXED)
-mongoose.connect(process.env.MONGO_URI, {
-  dbName: "IPS-IDS",
-  serverSelectionTimeoutMS: 8000,
-  socketTimeoutMS: 45000,
-})
-.then(() => {
-  console.log("✅ MongoDB Connected Successfully");
-  console.log("📂 Using Database: IPS-IDS");
-})
-.catch(err => {
-  console.error("❌ MongoDB Connection FAILED");
-  console.error(err);
-  process.exit(1);
-});
+function trackIpActivity(sourceIp) {
+  const now = Date.now();
+  const history = ipRequests[sourceIp] || [];
+  const recent = history.filter((timestamp) => now - timestamp <= PACKET_WINDOW_MS);
 
-// Optional: monitor connection state
-mongoose.connection.on("connected", () => {
-  console.log("🟢 Mongoose connected");
-});
-mongoose.connection.on("error", (err) => {
-  console.error("🔴 Mongoose error:", err);
-});
+  recent.push(now);
+  ipRequests[sourceIp] = recent;
 
-// ────────────────────────────────────────────────
-// REGISTER ROUTE
-app.post("/api/register", async (req, res) => {
-  try {
-    console.log("🔥 REGISTER HIT");
+  return recent.length;
+}
 
-    const { username, password } = req.body;
+function addThreat(attackType, sourceIp, threatLevel) {
+  const threatKey = `${sourceIp}:${attackType}`;
+  if (detectedThreatKeys.has(threatKey)) {
+    return null;
+  }
 
-    if (!username?.trim() || !password?.trim()) {
-      return res.status(400).json({ error: "Username and password required" });
+  detectedThreatKeys.add(threatKey);
+
+  const threat = {
+    attack_type: attackType,
+    category: attackType === "Port Scan" ? "Reconnaissance" : "Anomaly",
+    source_ip: sourceIp,
+    threat_level: threatLevel,
+    time: nowIso(),
+  };
+
+  // Persist threat globally so GET /api/threats always reflects detections.
+  threats.push(threat);
+  console.log("[THREAT DETECTED]", threat);
+  console.log("Threats:", threats);
+  return threat;
+}
+
+function blockIp(ip, reason) {
+  const existing = blockedIPs.find((entry) => entry.ip === ip);
+
+  if (existing) {
+    console.log("[IP BLOCKED] Already blocked:", existing);
+    return existing;
+  }
+
+  const blocked = {
+    ip,
+    reason,
+    blocked_at: nowIso(),
+  };
+
+  blockedIPs.push(blocked);
+  console.log("[IP BLOCKED]", blocked);
+  return blocked;
+}
+
+function detectThreats(packet, packetCountForIp) {
+  const detectedThreats = [];
+
+  if (packetCountForIp > PORT_SCAN_THRESHOLD) {
+    const threat = addThreat("Port Scan", packet.source_ip, "High");
+    if (threat) {
+      blockIp(packet.source_ip, "Port Scan detected: high packet frequency");
+      detectedThreats.push(threat);
     }
+  }
 
-    const cleanUsername = username.trim().toLowerCase();
-
-    const existing = await User.findOne({ username: cleanUsername });
-    if (existing) {
-      return res.status(409).json({ error: "Username already exists" });
+  if (typeof packet.size === "number" && packet.size > SUSPICIOUS_PACKET_SIZE_THRESHOLD) {
+    const threat = addThreat("Suspicious", packet.source_ip, "Medium");
+    if (threat) {
+      blockIp(packet.source_ip, `Suspicious packet size: ${packet.size}`);
+      detectedThreats.push(threat);
     }
+  }
 
-    const hashedPassword = await bcrypt.hash(password, 10);
+  return detectedThreats;
+}
 
-    const newUser = new User({
-      username: cleanUsername,
-      password: hashedPassword
-    });
+app.get("/api/packets", (req, res) => {
+  res.json(packets);
+});
 
-    const savedUser = await newUser.save();
+app.get("/api/threats", (req, res) => {
+  console.log("Threats:", threats);
+  res.json(threats);
+});
 
-    console.log("✅ User saved:", savedUser._id);
+app.get("/api/blocked-ips", (req, res) => {
+  res.json(blockedIPs);
+});
 
-    return res.status(201).json({
-      message: "Account created successfully",
-      username: savedUser.username
-    });
+app.post("/api/register", (req, res) => {
+  const username = String(req.body?.username || "").trim().toLowerCase();
+  const password = String(req.body?.password || "").trim();
 
-  } catch (err) {
-    console.error("❌ REGISTER ERROR:", err);
-    return res.status(500).json({
-      error: err.message
+  if (!username || !password) {
+    return res.status(400).json({ error: "Username and password required" });
+  }
+
+  const existing = users.find((user) => user.username === username);
+  if (existing) {
+    return res.status(409).json({ error: "Username already exists" });
+  }
+
+  users.push({ username, password, created_at: nowIso() });
+  return res.status(201).json({ message: "Account created", username });
+});
+
+app.post("/api/login", (req, res) => {
+  const username = String(req.body?.username || "").trim().toLowerCase();
+  const password = String(req.body?.password || "").trim();
+
+  if (!username || !password) {
+    return res.status(400).json({ error: "Username and password required" });
+  }
+
+  const user = users.find((entry) => entry.username === username);
+  if (!user || user.password !== password) {
+    return res.status(401).json({ error: "Invalid username or password" });
+  }
+
+  return res.json({ message: "Login successful", username: user.username });
+});
+
+app.post("/api/packet", (req, res) => {
+  const { source_ip, destination_ip, protocol, size } = req.body;
+
+  if (!source_ip || !destination_ip || !protocol) {
+    return res.status(400).json({
+      error: "source_ip, destination_ip, and protocol are required",
     });
   }
+
+  const packet = {
+    source_ip,
+    destination_ip,
+    protocol,
+    timestamp: nowIso(),
+    ...(typeof size === "number" ? { size } : {}),
+  };
+
+  packets.push(packet);
+  console.log("[NEW PACKET]", packet);
+
+  const requestCountForIp = trackIpActivity(source_ip);
+  const detectedThreats = detectThreats(packet, requestCountForIp);
+
+  return res.status(201).json({
+    message: "Packet processed",
+    packet,
+    threats_detected: detectedThreats,
+  });
 });
 
-// ────────────────────────────────────────────────
-// LOGIN ROUTE
-app.post("/api/login", async (req, res) => {
-  try {
-    console.log("🔥 LOGIN HIT");
-
-    const { username, password } = req.body;
-
-    if (!username?.trim() || !password) {
-      return res.status(400).json({ error: "Username and password required" });
-    }
-
-    const cleanUsername = username.trim().toLowerCase();
-
-    const user = await User.findOne({ username: cleanUsername });
-
-    if (!user) {
-      return res.status(401).json({ error: "Invalid username or password" });
-    }
-
-    const isMatch = await bcrypt.compare(password, user.password);
-
-    if (!isMatch) {
-      return res.status(401).json({ error: "Invalid username or password" });
-    }
-
-    console.log("✅ LOGIN SUCCESS:", cleanUsername);
-
-    return res.json({
-      message: "Login successful",
-      username: user.username
-    });
-
-  } catch (err) {
-    console.error("❌ LOGIN ERROR:", err);
-    return res.status(500).json({
-      error: err.message
-    });
-  }
-});
-
-// ────────────────────────────────────────────────
-// 🔥 TEST WRITE (STRONG DEBUG)
-app.get("/api/test-db-write", async (req, res) => {
-  try {
-    console.log("🔥 TEST WRITE HIT");
-
-    if (mongoose.connection.readyState !== 1) {
-      console.log("❌ DB not connected");
-      return res.status(500).json({ error: "Database not connected" });
-    }
-
-    const testUser = new User({
-      username: `test_${Date.now()}`,
-      password: "test123"
-    });
-
-    console.log("Saving test user...");
-
-    const saved = await testUser.save();
-
-    console.log("✅ Saved:", saved);
-
-    res.json({
-      success: true,
-      savedId: saved._id
-    });
-
-  } catch (err) {
-    console.error("❌ TEST WRITE ERROR:", err);
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
-  }
-});
-
-// ────────────────────────────────────────────────
-// TEST READ
-app.get("/api/test-db-read", async (req, res) => {
-  try {
-    console.log("🔥 TEST READ HIT");
-
-    const count = await User.countDocuments();
-    const users = await User.find().limit(5);
-
-    res.json({
-      success: true,
-      documentCount: count,
-      users
-    });
-
-  } catch (err) {
-    console.error("❌ TEST READ ERROR:", err);
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
-  }
-});
-
-// ────────────────────────────────────────────────
-// ROOT
 app.get("/", (req, res) => {
-  res.json({ message: "Backend running ✅" });
+  res.json({
+    message: "IDS/IPS backend running",
+    port: PORT,
+  });
 });
-
-// ────────────────────────────────────────────────
-// SERVER START
-const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
-  console.log("👉 Test: http://localhost:5000/api/test-db-write");
+  console.log(`IDS/IPS backend running on http://localhost:${PORT}`);
 });

@@ -20,16 +20,20 @@ export default function Login() {
         body: JSON.stringify({ username, password }),
       });
 
-      const data = await response.json();
+      const contentType = response.headers.get("content-type") || "";
+      const data = contentType.includes("application/json")
+        ? await response.json()
+        : { error: await response.text() };
 
       if (response.ok) {
         alert("✅ Login successful!");
         navigate("/dashboard");
       } else {
-        setError(data.error);
+        setError(data.error || "Login failed");
       }
     } catch (err) {
-      setError("Cannot connect to server. Make sure backend is running on port 5000");
+      console.error("Login error:", err);
+      setError("Cannot connect to server. Make sure backend is running on port 5000.");
     }
   };
 
